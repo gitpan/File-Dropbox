@@ -1,4 +1,4 @@
-use 5.012;
+use 5.010;
 
 use strict;
 use warnings;
@@ -15,8 +15,10 @@ my $builder = Module::Build->new(
 	},
 
 	requires => {
-		'Net::Curl' => '0.28',
-		'JSON'      => '2.0',
+		'Furl'            => '2.16',
+		'JSON'            => '2.0',
+		'Net::DNS::Lite'  => '0.1',
+		'IO::Socket::SSL' => '1.4',
 	},
 );
 

@@ -15,10 +15,12 @@ name: File-Dropbox
 provides:
   File::Dropbox:
     file: lib/File/Dropbox.pm
-    version: 0.3
+    version: 0.4
 requires:
+  Furl: 2.16
+  IO::Socket::SSL: 1.4
   JSON: 2.0
-  Net::Curl: 0.28
+  Net::DNS::Lite: 0.1
 resources:
   license: http://dev.perl.org/licenses/
-version: 0.3
+version: 0.4

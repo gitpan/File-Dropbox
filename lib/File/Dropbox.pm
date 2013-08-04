@@ -1,14 +1,17 @@
-package File::Dropbox 0.3;
+package File::Dropbox;
 use strict;
 use warnings;
 use feature ':5.10';
 use base qw{ Tie::Handle Exporter };
 use Symbol;
 use JSON;
-use Net::Curl::Easy ':constants';
-use Errno qw{ ENOENT EISDIR EINVAL EPERM EACCES EAGAIN };
+use Errno qw{ ENOENT EISDIR EINVAL EPERM EACCES EAGAIN ECANCELED };
 use Fcntl qw{ SEEK_CUR SEEK_SET SEEK_END };
+use Furl;
+use IO::Socket::SSL;
+use Net::DNS::Lite;
 
+our $VERSION = 0.4;
 our @EXPORT_OK = qw{ contents putfile metadata };
 
 my $hosts = {
@@ -19,7 +22,7 @@ my $hosts = {
 my $version = 1;
 
 my $header = <<'';
-Authorization: OAuth oauth_version="1.0", oauth_signature_method="PLAINTEXT", oauth_consumer_key="%s", oauth_token="%s", oauth_signature="%s&%s"
+OAuth oauth_version="1.0", oauth_signature_method="PLAINTEXT", oauth_consumer_key="%s", oauth_token="%s", oauth_signature="%s&%s"
 
 chomp $header;
 
@@ -41,12 +44,15 @@ sub TIEHANDLE {
 	die 'Unexpected root value'
 		unless $self->{'root'} =~ m{^(?:drop|sand)box$};
 
-	unless ($self->{'curl'}) {
-		my $curl = $self->{'curl'} = Net::Curl::Easy->new();
+	$self->{'furl'} = Furl->new(
+		timeout   => 10,
+		inet_aton => \&Net::DNS::Lite::inet_aton,
+		ssl_opts  => {
+			SSL_verify_mode => SSL_VERIFY_PEER(),
+		},
 
-		$curl->setopt(CURLOPT_PROTOCOLS,       CURLPROTO_HTTPS);
-		$curl->setopt(CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
-	}
+		%{ $self->{'furlopts'} //= {} },
+	);
 
 	$self->{'closed'}   = 1;
 	$self->{'length'}   = 0;
@@ -59,7 +65,6 @@ sub TIEHANDLE {
 
 sub READ {
 	my ($self, undef, $length, $offset) = @_;
-	my ($url, $curl);
 
 	undef $!;
 
@@ -69,49 +74,50 @@ sub READ {
 	substr($_[1] //= '', $offset // 0) = '', return 0
 		if $self->EOF();
 
-	$curl = $self->{'curl'};
+	my $furl = $self->{'furl'};
 
-	$url  = 'https://';
+	my $url = 'https://';
 	$url .= join '/', $hosts->{'content'}, $version;
 	$url .= join '/', '/files', $self->{'root'}, $self->{'path'};
 
-	$curl->setopt(CURLOPT_URL, $url);
-	$curl->setopt(CURLOPT_VERBOSE, $self->{'debug'}? 1 : 0);
-	$curl->setopt(CURLOPT_HTTPGET, 1);
-	$curl->setopt(CURLOPT_HTTPHEADER, [&__header__]);
-	$curl->setopt(CURLOPT_WRITEDATA, \(my $response));
-	$curl->setopt(CURLOPT_WRITEHEADER, \(my $headers));
-	$curl->setopt(CURLOPT_RANGE, join '-', $self->{'position'}, $self->{'position'} + ($length || 1));
+	my $response = $furl->get($url, [
+		Range => sprintf('bytes=%i-%i', $self->{'position'}, $self->{'position'} + ($length || 1)),
 
-	$curl->perform();
+		@{ &__headers__ },
+	]);
 
-	my $code = $curl->getinfo(CURLINFO_HTTP_CODE);
+	given ($response->code()) {
+		when (206) { 1 }
 
-	given ($code) {
-		1 when 206;
+		when ([401, 403]) {
+			$! = EACCES;
+			return 0;
+		}
 
-		$! = EACCES, return 0
-			when [401, 403];
+		when (500) {
+			continue unless $response->content() =~ m{\A(?:Cannot|Failed)};
 
-		$! = EAGAIN, return 0
-			when 503;
+			$! = ECANCELED;
+			return 0;
+		}
+
+		when (503) {
+			$self->{'meta'} = { retry => $response->header('Retry-After') };
+			$! = EAGAIN;
+			return 0;
+		}
 
 		default {
-			die join ' ', $code, $response
+			die join ' ', $_, $response->decoded_content();
 		}
 	}
 
-	my %headers = map {
-		my ($header, $value) = split m{: *}, $_, 2;
-		lc $header => $value
-	} split m{\r\n}, $headers;
-
-	my $meta  = from_json($headers{'x-dropbox-metadata'});
-	my $bytes = length $response;
+	my $meta  = $response->header('X-Dropbox-Metadata');
+	my $bytes = $response->header('Content-Length');
 
 	$self->{'position'} += $bytes > $length? $length : $bytes;
 
-	substr($_[1] //= '', $offset // 0) = substr $response, 0, $length;
+	substr($_[1] //= '', $offset // 0) = substr $response->content(), 0, $length;
 
 	return $bytes;
 } # READ
@@ -204,14 +210,17 @@ sub SEEK {
 	delete $self->{'eof'};
 
 	given ($whence) {
-		$self->{'position'} = $position
-			when SEEK_SET;
+		when (SEEK_SET) {
+			$self->{'position'} = $position
+		}
 
-		$self->{'position'} += $position
-			when SEEK_CUR;
+		when (SEEK_CUR) {
+			$self->{'position'} += $position
+		}
 
-		$self->{'position'} = $self->{'length'} + $position
-			when SEEK_END;
+		when (SEEK_END) {
+			$self->{'position'} = $self->{'length'} + $position
+		}
 
 		default {
 			$! = EINVAL;
@@ -292,12 +301,15 @@ sub OPEN {
 		unless $file;
 
 	given ($mode ||= '<') {
-		1 when '>';
-		1 when '<';
+		when (['>', '<']) { 1 }
 
-		$mode = '<' when 'r';
-		$mode = '>' when 'a';
-		$mode = '>' when 'w';
+		when ('r') {
+			$mode = '<';
+		}
+
+		when (['a', 'w']) {
+			$mode = '>';
+		}
 
 		default {
 			die 'Unsupported mode';
@@ -340,11 +352,16 @@ sub EOF {
 
 sub BINMODE { 1 }
 
-sub __header__ { sprintf $header, @{ $_[0] }{qw{ app_key access_token app_secret access_secret }} }
+sub __headers__ {
+	return [
+		'Authorization',
+		sprintf $header, @{ $_[0] }{qw{ app_key access_token app_secret access_secret }},
+	];
+}
 
 sub __flush__ {
 	my ($self) = @_;
-	my $curl = $self->{'curl'};
+	my $furl = $self->{'furl'};
 	my $url;
 
 	$url  = 'https://';
@@ -367,63 +384,58 @@ sub __flush__ {
 	$url .= join '=', 'offset', $self->{'offset'} || 0
 		unless $self->{'closed'};
 
-	$curl->setopt(CURLOPT_URL, $url);
-	$curl->setopt(CURLOPT_VERBOSE, $self->{'debug'}? 1 : 0);
-
-	my $headers = [
-		'Transfer-Encoding:',
-		'Expect:',
-		&__header__
-	];
-
-	$curl->setopt(CURLOPT_WRITEDATA, \(my $response));
+	my $response;
 
 	unless ($self->{'closed'}) {
 		use bytes;
 
 		my $buffer = substr $self->{'buffer'}, 0, $self->{'chunk'}, '';
 		my $length = length $buffer;
+
 		$self->{'length'} -= $length;
 		$self->{'offset'} += $length;
 
-		push @$headers, "Content-Length: $length";
-
-		open my $upload, '<', \$buffer;
-		$curl->setopt(CURLOPT_READDATA, $upload);
-		$curl->setopt(CURLOPT_UPLOAD, 1);
+		$response = $furl->put($url, &__headers__, $buffer);
 	} else {
-		$curl->setopt(CURLOPT_UPLOAD, 0);
-		$curl->setopt(CURLOPT_POSTFIELDS, '');
+		$response = $furl->post($url, &__headers__);
 	}
 
-	$curl->setopt(CURLOPT_HTTPHEADER, $headers);
+	given ($response->code()) {
+		when (400) {
+			$! = EINVAL;
+			return 0;
+		}
 
-	$curl->perform();
+		when ([401, 403]) {
+			$! = EACCES;
+			return 0;
+		}
 
-	my $code = $curl->getinfo(CURLINFO_HTTP_CODE);
+		when (500) {
+			continue unless $response->content() =~ m{\A(?:Cannot|Failed)};
 
-	given ($code) {
-		$! = EINVAL, return 0
-			when 400;
+			$! = ECANCELED;
+			return 0;
+		}
 
-		$! = EACCES, return 0
-			when [401, 403];
-
-		$! = EAGAIN, return 0
-			when 503;
+		when (503) {
+			$self->{'meta'} = { retry => $response->header('Retry-After') };
+			$! = EAGAIN;
+			return 0;
+		}
 
 		when (200) {
-			$self->{'meta'} = from_json($response)
+			$self->{'meta'} = from_json($response->content())
 				if $self->{'closed'};
 		}
 
 		default {
-			die join ' ', $code, $response
+			die join ' ', $_, $response->decoded_content();
 		}
 	}
 
 	unless ($self->{'upload_id'}) {
-		$response = from_json($response);
+		$response = from_json($response->content());
 		$self->{'upload_id'} = $response->{'upload_id'};
 	}
 
@@ -432,9 +444,9 @@ sub __flush__ {
 
 sub __meta__ {
 	my ($self) = @_;
-	my ($url, $meta, $curl);
+	my ($url, $meta);
 
-	$curl = $self->{'curl'};
+	my $furl = $self->{'furl'};
 
 	$url  = 'https://';
 	$url .= join '/', $hosts->{'api'}, $version;
@@ -443,36 +455,45 @@ sub __meta__ {
 	$url .= '?hash='. delete $self->{'hash'}
 		if $self->{'hash'};
 
-	$curl->setopt(CURLOPT_URL, $url);
-	$curl->setopt(CURLOPT_VERBOSE, $self->{'debug'}? 1 : 0);
-	$curl->setopt(CURLOPT_HTTPGET, 1);
-	$curl->setopt(CURLOPT_HTTPHEADER, [&__header__]);
-	$curl->setopt(CURLOPT_WRITEDATA, \(my $response));
+	my $response = $furl->get($url, &__headers__);
 
-	$curl->perform();
+	given ($response->code()) {
+		when ([401, 403]) {
+			$! = EACCES;
+			return 0;
+		}
 
-	my $code = $curl->getinfo(CURLINFO_HTTP_CODE);
+		when (404) {
+			$! = ENOENT;
+			return 0;
+		}
 
-	given ($code) {
-		$! = EACCES, return 0
-			when [401, 403];
+		when (406) {
+			$! = EPERM;
+			return 0;
+		}
 
-		$! = ENOENT, return 0
-			when 404;
+		when (500) {
+			continue unless $response->content() =~ m{\A(?:Cannot|Failed)};
 
-		$! = EPERM, return 0
-			when 406;
+			$! = ECANCELED;
+			return 0;
+		}
 
-		$! = EAGAIN, return 0
-			when 503;
+		when (503) {
+			$self->{'meta'} = { retry => $response->header('Retry-After') };
+			$! = EAGAIN;
+			return 0;
+		}
 
-		$meta = $self->{'meta'} = from_json($response)
-			when 200;
+		when (200) {
+			$meta = $self->{'meta'} = from_json($response->content());
+		}
 
-		1 when 304;
+		when (304) { 1 }
 
 		default {
-			die join ' ', $code, $response;
+			die join ' ', $_, $response->decoded_content();
 		}
 	}
 
@@ -512,56 +533,51 @@ sub putfile ($$$) {
 	close $handle or return 0;
 
 	my $self = *$handle{'HASH'};
-	my $curl = $self->{'curl'};
+	my $furl = $self->{'furl'};
 	my ($url, $length);
 
 	$url  = 'https://';
 	$url .= join '/', $hosts->{'content'}, $version;
 	$url .= join '/', '/files_put', $self->{'root'}, $path;
 
-	$curl->setopt(CURLOPT_URL, $url);
-	$curl->setopt(CURLOPT_VERBOSE, $self->{'debug'}? 1 : 0);
-	$curl->setopt(CURLOPT_WRITEDATA, \(my $response));
-
 	{
 		use bytes;
 		$length = length $data;
 	}
 
-	my $headers = [
-		'Transfer-Encoding:',
-		'Expect:',
-		"Content-Length: $length",
-		__header__($self)
-	];
+	my $response = $furl->put($url, $self->__headers__(), $data);
 
-	open my $upload, '<', \$data;
+	given ($response->code()) {
+		when (400) {
+			$! = EINVAL;
+			return 0;
+		}
 
-	$curl->setopt(CURLOPT_UPLOAD, 1);
-	$curl->setopt(CURLOPT_HTTPHEADER, $headers);
-	$curl->setopt(CURLOPT_READDATA, $upload);
+		when ([401, 403]) {
+			$! = EACCES;
+			return 0;
+		}
 
-	$curl->perform();
+		when (500) {
+			continue unless $response->content() =~ m{\A(?:Cannot|Failed)};
 
-	my $code = $curl->getinfo(CURLINFO_HTTP_CODE);
+			$! = ECANCELED;
+			return 0;
+		}
 
-	given ($code) {
-		$! = EINVAL, return 0
-			when 400;
-
-		$! = EACCES, return 0
-			when [401, 403];
-
-		$! = EAGAIN, return 0
-			when 503;
+		when (503) {
+			$self->{'meta'} = { retry => $response->header('Retry-After') };
+			$! = EAGAIN;
+			return 0;
+		};
 
 		when (200) {
 			$self->{'path'} = $path;
-			$self->{'meta'} = from_json($response);
+			$self->{'meta'} = from_json($response->content());
 		}
 
 		default {
-			die join ' ', $code, $response
+			die join ' ', $_, $response->decoded_content();
 		}
 	}
 
@@ -630,7 +646,8 @@ File::Dropbox - Convenient and fast Dropbox API abstraction
 =head1 DESCRIPTION
 
 C<File::Dropbox> provides high-level Dropbox API abstraction based on L<Tie::Handle>. Code required to get C<access_token> and
-C<access_secret> for signed OAuth requests is not included in this module.
+C<access_secret> for signed OAuth 1.0 requests is not included in this module. To get C<app_key> and C<app_secret> you need to register
+your application with Dropbox.
 
 At this moment Dropbox API is not fully supported, C<File::Dropbox> covers file read/write and directory listing methods. If you need full
 API support take look at L<WebService::Dropbox>. C<File::Dropbox> main purpose is not 100% API coverage,
@@ -642,9 +659,8 @@ L<close|perlfunc/close>, L<seek|perlfunc/seek>, L<tell|perlfunc/tell>, L<readlin
 L<sysread|perlfunc/sysread>, L<getc|perlfunc/getc>, L<eof|perlfunc/eof>. For write-only state: L<open|perlfunc/open>, L<close|perlfunc/close>,
 L<syswrite|perlfunc/syswrite>, L<print|perlfunc/print>, L<printf|perlfunc/printf>, L<say|perlfunc/say>.
 
-All API requests are done using L<Net::Curl> module and libcurl will reuse same connection as long as possible.
-This greatly improves overall module performance. To go even further you can share L<Net::Curl::Easy> object between different C<File::Dropbox>
-objects, see L</new> for details.
+All API requests are done using L<Furl> module. For more accurate timeouts L<Net::DNS::Lite> is used, as described in L<Furl::HTTP>. Furl settings
+can be overriden using C<furlopts>.
 
 =head1 METHODS
 
@@ -656,8 +672,10 @@ objects, see L</new> for details.
         app_secret    => 'app secret',
         app_key       => 'app key',
         chunk         => 8 * 1024 * 1024,
-        curl          => $curl,
         root          => 'dropbox',
+        furlopts      => {
+            timeout => 20
+        }
     );
 
 Constructor, takes key-value pairs list
@@ -666,41 +684,37 @@ Constructor, takes key-value pairs list
 
 =item access_secret
 
-OAuth access secret
+OAuth 1.0 access secret
 
 =item access_token
 
-OAuth access token
+OAuth 1.0 access token
 
 =item app_secret
 
-OAuth app secret
+OAuth 1.0 app secret
 
 =item app_key
 
-OAuth app key
+OAuth 1.0 app key
 
 =item chunk
 
 Upload chunk size in bytes. Also buffer size for C<readline>. Optional. Defaults to 4MB.
 
-=item curl
-
-C<Net::Curl::Easy> object to use. Optional.
-
-    # Get curl object
-    my $curl = *$dropbox->{'curl'};
-
-    # And share it
-    my $dropbox2 = File::Dropbox->new(%app, curl => $curl);
-
 =item root
 
 Access type, C<sandbox> for app-folder only access and C<dropbox> for full access.
 
-=item debug
+=item furlopts
 
-Enable libcurl debug output.
+Parameter hash, passed to L<Furl> constructor directly. Default options
+
+    timeout   => 10,
+    inet_aton => \&Net::DNS::Lite::inet_aton,
+    ssl_opts  => {
+        SSL_verify_mode => SSL_VERIFY_PEER(),
+    }
 
 =back
 
@@ -745,7 +759,7 @@ call to L</contents> or L</putfile>.
 Arguments: $dropbox, $path, $data
 
 Function is useful for uploading small files (up to 150MB possible) in one request (at least
-two API requests required for chunked upload, used in open-write-close cycle). If there is
+two API requests required for chunked upload, used in open-write-close sequence). If there is
 unfinished chunked upload on handle, it will be commited.
 
     local $/;
@@ -759,7 +773,7 @@ unfinished chunked upload on handle, it will be commited.
 
 =head1 SEE ALSO
 
-L<Net::Curl>, L<WebService::Dropbox>, L<Dropbox API|https://www.dropbox.com/developers/core/docs>
+L<Furl>, L<Furl::HTTP>, L<WebService::Dropbox>, L<Dropbox API|https://www.dropbox.com/developers/core/docs>
 
 =head1 AUTHOR
 

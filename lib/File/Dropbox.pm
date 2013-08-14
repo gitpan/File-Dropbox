@@ -5,13 +5,13 @@ use feature ':5.10';
 use base qw{ Tie::Handle Exporter };
 use Symbol;
 use JSON;
-use Errno qw{ ENOENT EISDIR EINVAL EPERM EACCES EAGAIN ECANCELED };
+use Errno qw{ ENOENT EISDIR EINVAL EPERM EACCES EAGAIN ECANCELED EFBIG };
 use Fcntl qw{ SEEK_CUR SEEK_SET SEEK_END };
 use Furl;
 use IO::Socket::SSL;
 use Net::DNS::Lite;
 
-our $VERSION = 0.4;
+our $VERSION = 0.5;
 our @EXPORT_OK = qw{ contents putfile metadata };
 
 my $hosts = {
@@ -21,10 +21,14 @@ my $hosts = {
 
 my $version = 1;
 
-my $header = <<'';
-OAuth oauth_version="1.0", oauth_signature_method="PLAINTEXT", oauth_consumer_key="%s", oauth_token="%s", oauth_signature="%s&%s"
+my $header1 = join ', ',
+	'OAuth oauth_version="1.0"',
+	'oauth_signature_method="PLAINTEXT"',
+	'oauth_consumer_key="%s"',
+	'oauth_token="%s"',
+	'oauth_signature="%s&%s"';
 
-chomp $header;
+my $header2 = 'Bearer %s';
 
 sub new {
 	my $self = Symbol::gensym;
@@ -355,7 +359,9 @@ sub BINMODE { 1 }
 sub __headers__ {
 	return [
 		'Authorization',
-		sprintf $header, @{ $_[0] }{qw{ app_key access_token app_secret access_secret }},
+		$_[0]->{'oauth2'}?
+			sprintf $header2, $_[0]->{'access_token'}:
+			sprintf $header1, @{ $_[0] }{qw{ app_key access_token app_secret access_secret }},
 	];
 }
 
@@ -421,6 +427,11 @@ sub __flush__ {
 		when (503) {
 			$self->{'meta'} = { retry => $response->header('Retry-After') };
 			$! = EAGAIN;
+			return 0;
+		}
+
+		when (507) {
+			$! = EFBIG;
 			return 0;
 		}
 
@@ -571,6 +582,11 @@ sub putfile ($$$) {
 			return 0;
 		};
 
+		when (507) {
+			$! = EFBIG;
+			return 0;
+		}
+
 		when (200) {
 			$self->{'path'} = $path;
 			$self->{'meta'} = from_json($response->content());
@@ -646,8 +662,8 @@ File::Dropbox - Convenient and fast Dropbox API abstraction
 =head1 DESCRIPTION
 
 C<File::Dropbox> provides high-level Dropbox API abstraction based on L<Tie::Handle>. Code required to get C<access_token> and
-C<access_secret> for signed OAuth 1.0 requests is not included in this module. To get C<app_key> and C<app_secret> you need to register
-your application with Dropbox.
+C<access_secret> for signed OAuth 1.0 requests or C<access_token> for OAuth 2.0 requests is not included in this module.
+To get C<app_key> and C<app_secret> you need to register your application with Dropbox.
 
 At this moment Dropbox API is not fully supported, C<File::Dropbox> covers file read/write and directory listing methods. If you need full
 API support take look at L<WebService::Dropbox>. C<File::Dropbox> main purpose is not 100% API coverage,
@@ -678,6 +694,11 @@ can be overriden using C<furlopts>.
         }
     );
 
+    my $dropbox = File::Dropbox->new(
+        access_token => 'token',
+        oauth2       => 1
+    );
+
 Constructor, takes key-value pairs list
 
 =over
@@ -688,7 +709,7 @@ OAuth 1.0 access secret
 
 =item access_token
 
-OAuth 1.0 access token
+OAuth 1.0 access token or OAuth 2.0 access token
 
 =item app_secret
 
@@ -697,6 +718,10 @@ OAuth 1.0 app secret
 =item app_key
 
 OAuth 1.0 app key
+
+=item oauth2
+
+OAuth 2.0 switch, defaults to false.
 
 =item chunk
 

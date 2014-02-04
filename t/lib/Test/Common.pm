@@ -7,9 +7,9 @@ use Fcntl qw{ SEEK_CUR SEEK_SET SEEK_END };
 use Errno qw{ ENOENT EISDIR EINVAL EPERM EACCES ECANCELED };
 
 our %EXPORT_TAGS = (
-	seek  => [qw{ SEEK_CUR SEEK_SET SEEK_END }],
-	fcntl => [qw{ ENOENT EISDIR EINVAL EPERM EACCES ECANCELED }],
-	func  => [qw{ okay errn conf }],
+	fcntl => [qw{ SEEK_CUR SEEK_SET SEEK_END }],
+	errno => [qw{ ENOENT EISDIR EINVAL EPERM EACCES ECANCELED }],
+	func  => [qw{ okay errn conf base }],
 );
 
 our @EXPORT_OK = map { @$_ } values %EXPORT_TAGS;
@@ -34,16 +34,17 @@ sub errn (&$$) {
 sub conf {
 	my %app;
 
-	if (exists $ENV{'DROPBOX_AUTH2'}) {
-		@app{qw{ oauth2 access_token }} = (1, $ENV{'DROPBOX_AUTH2'});
-	} else {
-		@app{qw{ app_key app_secret access_token access_secret }} = split ':', $ENV{'DROPBOX_AUTH'} || '';
+	if (exists $ENV{'DROPBOX_AUTH'}) {
+		if (~index $ENV{'DROPBOX_AUTH'}, ':') {
+			@app{qw{ app_key app_secret access_token access_secret }} = split ':', $ENV{'DROPBOX_AUTH'} || '';
+		} else {
+			@app{qw{ oauth2 access_token }} = (1, $ENV{'DROPBOX_AUTH'});
+		}
 	}
-
-	%app = ()
-		if grep { not defined or not length } values %app;
 
 	return \%app;
 } # conf
+
+sub base { 'test' }
 
 1;

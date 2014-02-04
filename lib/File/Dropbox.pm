@@ -11,8 +11,8 @@ use Furl;
 use IO::Socket::SSL;
 use Net::DNS::Lite;
 
-our $VERSION = 0.5;
-our @EXPORT_OK = qw{ contents putfile metadata };
+our $VERSION = 0.6;
+our @EXPORT_OK = qw{ contents metadata putfile movefile copyfile createfolder deletefile };
 
 my $hosts = {
 	content => 'api-content.dropbox.com',
@@ -499,6 +499,12 @@ sub __meta__ {
 
 		when (200) {
 			$meta = $self->{'meta'} = from_json($response->content());
+
+			# XXX: Dropbox returns metadata for recently deleted files
+			if ($meta->{'is_deleted'}) {
+				$! = ENOENT;
+				return 0;
+			}
 		}
 
 		when (304) { 1 }
@@ -516,6 +522,77 @@ sub __meta__ {
 
 	return 1;
 } # __meta__
+
+sub __fileops__ {
+	my ($type, $handle, $source, $target) = @_;
+
+	my $self = *$handle{'HASH'};
+	my $furl = $self->{'furl'};
+	my ($url, @arguments);
+
+	$url  = 'https://';
+	$url .= join '/', $hosts->{'api'}, $version;
+	$url .= join '/', '/fileops', $type;
+
+	given ($type) {
+		when (['move', 'copy']) {
+			@arguments = (
+				from_path => $source,
+				to_path   => $target,
+			);
+		}
+
+		default {
+			@arguments = (
+				path => $source,
+			);
+		}
+	}
+
+	push @arguments, root => $self->{'root'};
+
+	my $response = $furl->post($url, $self->__headers__(), \@arguments);
+
+	given ($response->code()) {
+		when (200) {
+			$self->{'meta'} = from_json($response->content());
+		}
+
+		when ([401, 403]) {
+			$! = EACCES;
+			return 0;
+		}
+
+		when (404) {
+			$! = ENOENT;
+			return 0;
+		}
+
+		when (406) {
+			$! = EPERM;
+			return 0;
+		}
+
+		when (500) {
+			continue unless $response->content() =~ m{\A(?:Cannot|Failed)};
+
+			$! = ECANCELED;
+			return 0;
+		}
+
+		when (503) {
+			$self->{'meta'} = { retry => $response->header('Retry-After') };
+			$! = EAGAIN;
+			return 0;
+		}
+
+		default {
+			die join ' ', $_, $response->decoded_content();
+		}
+	}
+
+	return 1;
+} # __fileops__
 
 sub contents ($;$$) {
 	my ($handle, $path, $hash) = @_;
@@ -599,6 +676,11 @@ sub putfile ($$$) {
 
 	return 1;
 } # putfile
+
+sub movefile    ($$$) { __fileops__('move', @_) }
+sub copyfile    ($$$) { __fileops__('copy', @_) }
+sub deletefile   ($$) { __fileops__('delete', @_) }
+sub createfolder ($$) { __fileops__('create_folder', @_) }
 
 sub metadata ($) {
 	my ($handle) = @_;
@@ -796,6 +878,50 @@ unfinished chunked upload on handle, it will be commited.
 
     close $data;
 
+=head2 copyfile
+
+Arguments: $dropbox, $source, $target
+
+Function copies file or directory from one location to another. Metadata for copy
+can be accessed using L</metadata> function.
+
+    copyfile($dropbox, '/data/2012.dat', '/data/2012.dat.bak') or die $!;
+
+    say 'Created backup with revision ', metadata($dropbox)->{'revision'};
+
+=head2 movefile
+
+Arguments: $dropbox, $source, $target
+
+Function moves file or directory from one location to another. Metadata for moved file
+can be accessed using L</metadata> function.
+
+    movefile($dropbox, '/data/2012.dat', '/data/2012.dat.bak') or die $!;
+
+    say 'Created backup with size ', metadata($dropbox)->{'size'};
+
+=head2 deletefile
+
+Arguments: $dropbox, $path
+
+Function deletes file or folder at specified path. Metadata for deleted item
+is accessible via L</metadata> function.
+
+    deletefile($dropbox, '/data/2012.dat.bak') or die $!;
+
+    say 'Deleted backup with last modification ', metadata($dropbox)->{'modification'};
+
+=head2 createfolder
+
+Arguments: $dropbox, $path
+
+Function creates folder at specified path. Metadata for created folder
+is accessible via L</metadata> function.
+
+    createfolder($dropbox, '/data/backups') or die $!;
+
+    say 'Created folder at path ', metadata($dropbox)->{'path'};
+
 =head1 SEE ALSO
 
 L<Furl>, L<Furl::HTTP>, L<WebService::Dropbox>, L<Dropbox API|https://www.dropbox.com/developers/core/docs>
@@ -806,7 +932,7 @@ Alexander Nazarov <nfokz@cpan.org>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright 2013 Alexander Nazarov
+Copyright 2013, 2014 Alexander Nazarov
 
 This program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
